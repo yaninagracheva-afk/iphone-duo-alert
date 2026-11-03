@@ -5,24 +5,21 @@ import time
 import urllib.request
 import urllib.parse
 import urllib.error
+from pathlib import Path
 
-# iPhone Duo 256 GB Night Sky — Singapore
+# iPhone Duo 256 GB Night Sky
 MODEL = "MK2E4X/A"
-
-# Telegram settings
-CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
-TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-
-# Check ONLY Apple Marina Bay Sands
 STORE_NAME = "marina bay"
 
-APPLE_LINK = (
-    "https://www.apple.com/sg/shop/buy-iphone/iphone-duo"
-)
+TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
-# Retry settings
+APPLE_LINK = "https://www.apple.com/sg/shop/buy-iphone/iphone-duo"
+STATE_FILE = Path("state.json")
+
 MAX_ATTEMPTS = 3
 RETRY_DELAYS = [15, 45]
+FAILURE_THRESHOLD = 3
 
 params = urllib.parse.urlencode({
     "parts.0": MODEL,
@@ -38,7 +35,6 @@ URL = (
 
 def request_json(url, payload=None):
     data = None
-
     headers = {
         "User-Agent": "Mozilla/5.0",
         "Accept": "application/json"
@@ -49,9 +45,7 @@ def request_json(url, payload=None):
         headers["Content-Type"] = "application/json"
 
     req = urllib.request.Request(
-        url,
-        data=data,
-        headers=headers
+        url, data=data, headers=headers
     )
 
     with urllib.request.urlopen(req, timeout=25) as r:
@@ -59,14 +53,33 @@ def request_json(url, payload=None):
 
 
 def send_telegram(message):
-    url = (
-        f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    )
-
-    request_json(url, {
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+    result = request_json(url, {
         "chat_id": CHAT_ID,
         "text": message
     })
+
+    if not result.get("ok"):
+        raise RuntimeError("Telegram message failed")
+
+    print("Telegram notification sent", flush=True)
+
+
+def load_state():
+    if STATE_FILE.exists():
+        return json.loads(STATE_FILE.read_text())
+
+    return {
+        "available": False,
+        "failures": 0,
+        "failure_alert_sent": False
+    }
+
+
+def save_state(state):
+    STATE_FILE.write_text(
+        json.dumps(state, indent=2) + "\n"
+    )
 
 
 def fetch_apple_stock():
@@ -78,7 +91,6 @@ def fetch_apple_stock():
             )
 
             result = request_json(URL)
-
             print("Apple responded successfully", flush=True)
             return result
 
@@ -88,93 +100,113 @@ def fetch_apple_stock():
             TimeoutError,
             json.JSONDecodeError
         ) as error:
-
-            print(
-                f"Apple request failed: {error}",
-                flush=True
-            )
+            print(f"Apple request failed: {error}", flush=True)
 
             if attempt == MAX_ATTEMPTS:
                 raise RuntimeError(
-                    "Apple stock check failed after "
-                    f"{MAX_ATTEMPTS} attempts"
+                    "Apple check failed after all retries"
                 ) from error
 
-            delay = RETRY_DELAYS[attempt - 1]
-
-            print(
-                f"Retrying in {delay} seconds...",
-                flush=True
-            )
-
-            time.sleep(delay)
+            time.sleep(RETRY_DELAYS[attempt - 1])
 
 
-def check_stock():
+def get_availability():
     result = fetch_apple_stock()
-
     stores = result.get("body", {}).get("stores")
 
     if not isinstance(stores, list):
-        raise RuntimeError(
-            "Apple inventory response format changed"
-        )
-
-    found = []
-    checked = 0
+        raise RuntimeError("Unexpected Apple response format")
 
     for store in stores:
         name = store.get("storeName", "")
-        name_lower = name.lower()
 
-        # Only Apple Marina Bay Sands
-        if STORE_NAME not in name_lower:
+        if STORE_NAME not in name.lower():
             continue
-
-        checked += 1
 
         availability = store.get(
             "partsAvailability", {}
-        ).get(MODEL, {})
+        ).get(MODEL)
 
-        pickup_status = availability.get(
-            "pickupDisplay", "unknown"
-        )
+        if not isinstance(availability, dict):
+            raise RuntimeError("Model availability data missing")
 
-        print(
-            f"Store: {name}, pickup: {pickup_status}",
-            flush=True
-        )
+        status = availability.get("pickupDisplay")
 
-        if pickup_status == "available":
-            found.append(name)
+        print(f"Store: {name}, pickup: {status}", flush=True)
 
-    if checked == 0:
+        if status == "available":
+            return True
+
+        if status == "unavailable":
+            return False
+
         raise RuntimeError(
-            "Apple Marina Bay Sands not found in response"
+            f"Unknown pickup status: {status}"
         )
 
-    print(f"Stores checked: {checked}")
-    print(f"Available at: {found}")
+    raise RuntimeError("Marina Bay Sands store not found")
 
-    if found:
-        message = (
+
+def main():
+    state = load_state()
+
+    try:
+        available = get_availability()
+
+    except Exception as error:
+        print(f"Stock check unavailable: {error}", flush=True)
+
+        state["failures"] = min(
+            state.get("failures", 0) + 1,
+            FAILURE_THRESHOLD
+        )
+
+        if (
+            state["failures"] >= FAILURE_THRESHOLD
+            and not state.get("failure_alert_sent", False)
+        ):
+            send_telegram(
+                "⚠️ iPhone Duo Alert\n\n"
+                "Не удалось проверить наличие в Apple "
+                "Marina Bay Sands 3 запуска подряд.\n\n"
+                "Apple может временно блокировать запросы. "
+                "Мониторинг требует внимания."
+            )
+
+            state["failure_alert_sent"] = True
+
+        save_state(state)
+        return
+
+    # Successful Apple response resets failure counter
+    if state.get("failure_alert_sent", False):
+        print("Apple monitoring recovered", flush=True)
+
+    state["failures"] = 0
+    state["failure_alert_sent"] = False
+
+    previously_available = state.get("available", False)
+
+    if available and not previously_available:
+        send_telegram(
             "🚨 iPhone Duo 256GB Night Sky В НАЛИЧИИ!\n\n"
             "📍 Apple Marina Bay Sands, Singapore\n\n"
             "✅ Доступен для самовывоза!\n\n"
             "Купить: " + APPLE_LINK
         )
 
-        send_telegram(message)
-
-        print("Telegram stock alert sent", flush=True)
-
-    else:
+    elif available:
         print(
-            "iPhone not confirmed available for pickup",
+            "Still available — notification already sent",
             flush=True
         )
 
+    else:
+        print("Currently unavailable", flush=True)
+
+    state["available"] = available
+    save_state(state)
+
 
 if __name__ == "__main__":
-    check_stock()
+    main()
