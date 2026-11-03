@@ -3,8 +3,15 @@ name: iPhone Duo Singapore Alert
 
 on:
   schedule:
-    - cron: "*/10 * * * *"
+    - cron: "3,13,23,33,43,53 * * * *"
   workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: iphone-duo-stock-monitor
+  cancel-in-progress: false
 
 jobs:
   check-stock:
@@ -13,6 +20,8 @@ jobs:
     steps:
       - name: Download code
         uses: actions/checkout@v4
+        with:
+          ref: main
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -24,6 +33,16 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python monitor.py
+
+      - name: Save monitoring state
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state.json
+          if ! git diff --cached --quiet; then
+            git commit -m "Update iPhone stock monitoring state"
+            git push
+          fi
 
       - name: Test Telegram notification
         if: github.event_name == 'workflow_dispatch'
@@ -40,10 +59,9 @@ jobs:
           chat_id = os.environ["TELEGRAM_CHAT_ID"]
 
           url = f"https://api.telegram.org/bot{token}/sendMessage"
-
           data = json.dumps({
               "chat_id": chat_id,
-              "text": "✅ Тест успешен! Бот iPhone Duo работает."
+              "text": "✅ Тест успешен! Мониторинг iPhone Duo работает."
           }).encode("utf-8")
 
           req = urllib.request.Request(
